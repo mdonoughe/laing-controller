@@ -1,15 +1,19 @@
-use futures::future::Future;
-use futures::Async;
-use std::io::{self, Read, Write};
-use std::time::{Duration, Instant};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_timer::Delay;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration};
+use pin_project::pin_project;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Sleep;
 
 /// A wrapper around an AsyncRead+AsyncWrite to add read timeouts.
+#[pin_project]
 pub struct TimeoutPort<T> {
+    #[pin]
     inner: T,
     timeout: Duration,
-    timeout_delay: Option<Delay>,
+    timeout_delay: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T> TimeoutPort<T> {
@@ -22,50 +26,54 @@ impl<T> TimeoutPort<T> {
     }
 }
 
-impl<T: Read> Read for TimeoutPort<T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        match self.inner.read(buf) {
-            Ok(r) => {
-                self.timeout_delay = None;
-                Ok(r)
+impl<T: AsyncRead> AsyncRead for TimeoutPort<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.project();
+        match this.inner.poll_read(cx, buf) {
+            Poll::Ready(r) => {
+                *this.timeout_delay = None;
+                Poll::Ready(r)
             }
-            Err(e) => match e.kind() {
-                io::ErrorKind::WouldBlock => {
-                    let timeout = self.timeout;
-                    match self
-                        .timeout_delay
-                        .get_or_insert_with(|| Delay::new(Instant::now() + timeout))
-                        .poll()
-                    {
-                        Ok(Async::NotReady) => Err(e),
-                        _ => {
-                            self.timeout_delay = None;
-                            Err(io::Error::from(io::ErrorKind::TimedOut))
-                        }
+            Poll::Pending => {
+                let timeout = *this.timeout;
+                match this
+                    .timeout_delay
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)))
+                    .as_mut()
+                    .poll(cx)
+                {
+                    Poll::Pending => Poll::Pending,
+                    _ => {
+                        *this.timeout_delay = None;
+                        Poll::Ready(Err(io::Error::from(io::ErrorKind::TimedOut)))
                     }
                 }
-                _ => {
-                    self.timeout_delay = None;
-                    Err(e)
-                }
-            },
+            }
         }
     }
 }
 
-impl<T: AsyncRead> AsyncRead for TimeoutPort<T> {}
-
-impl<T: Write> Write for TimeoutPort<T> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> Result<(), io::Error> {
-        self.inner.flush()
-    }
-}
-
 impl<T: AsyncWrite> AsyncWrite for TimeoutPort<T> {
-    fn shutdown(&mut self) -> Result<Async<()>, io::Error> {
-        self.inner.shutdown()
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.project();
+        this.inner.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.project();
+        this.inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.project();
+        this.inner.poll_shutdown(cx)
     }
 }

@@ -2,13 +2,11 @@
 name = "desk"
 version = "0.1.0"
 authors = ["Matthew Donoughe <mdonoughe@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 clap = "2.32"
-futures = "0.1.25"
-tokio-core = "0.1.17"
-tokio-io = "0.1.11"
-tokio-modbus = { git = "https://github.com/mdonoughe/tokio-modbus", branch = "serial-traits", default-features = false, features = ["rtu"] }
-tokio-serial = "3.2"
-tokio-timer = "0.2"
+pin-project = "1.0.10"
+tokio = { version = "1.15.0", features = ["macros", "rt", "time"] }
+tokio-modbus = { version = "0.5.2", default-features = false, features = ["rtu"] }
+tokio-serial = "5.4.1"

@@ -1,38 +1,15 @@
 #[macro_use]
 extern crate clap;
-extern crate futures;
-extern crate tokio_core;
-extern crate tokio_modbus;
-extern crate tokio_serial;
-extern crate tokio_timer;
 
 mod timeout;
 mod transfer;
 
 use clap::{Arg, SubCommand};
-use futures::future::{self, Future};
-use std::io;
+use tokio_serial::{SerialStream};
 use std::time::Duration;
 use timeout::TimeoutPort;
-use tokio_core::reactor::{Core, Handle};
-use tokio_io::AsyncRead;
-use tokio_io::AsyncWrite;
-use tokio_modbus::client::Context;
 use tokio_modbus::prelude::*;
-use tokio_serial::{Serial, SerialPortSettings};
 use transfer::TransferPort;
-
-struct Modbus<T> {
-    handle: Handle,
-    port: TransferPort<T>,
-    slave: Slave,
-}
-
-impl<T: AsyncRead + AsyncWrite + 'static> Modbus<T> {
-    pub fn connect(&self) -> impl Future<Item = Context, Error = io::Error> {
-        rtu::connect_slave(&self.handle, self.port.take(), self.slave)
-    }
-}
 
 static WAKE: [u16; 14] = [
     0x0000, 0x0000, 0x0009, 0x0000, 0x0008, 0x0005, 0x0001, 0x005A, 0x0011, 0x0008, 0x0017, 0x0000,
@@ -63,7 +40,8 @@ static DOWN: [[u16; 14]; 2] = [
     ],
 ];
 
-pub fn main() {
+#[tokio::main(flavor = "current_thread")]
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = app_from_crate!()
         .arg(
             Arg::with_name("port")
@@ -76,22 +54,11 @@ pub fn main() {
         .subcommand(SubCommand::with_name("down"))
         .get_matches();
 
-    let mut core = Core::new().unwrap();
     let tty_path = matches.value_of("port").unwrap();
     let server_addr = Slave(0x01);
 
-    let mut settings = SerialPortSettings::default();
-    settings.baud_rate = 57600;
-    settings.timeout = Duration::from_millis(250);
-    let port = TransferPort::new(TimeoutPort::new(
-        Serial::from_path(tty_path, &settings).unwrap(),
-        Duration::from_secs(1),
-    ));
-    let modbus = Modbus {
-        handle: core.handle(),
-        port,
-        slave: server_addr,
-    };
+    let settings = tokio_serial::new(tty_path, 57600)
+        .timeout(Duration::from_millis(250));
 
     let command = match matches.subcommand() {
         ("up", _) => UP,
@@ -102,83 +69,53 @@ pub fn main() {
         }
     };
 
-    let task = future::loop_fn(modbus, move |modbus| {
-        modbus.connect().and_then(move |client| {
-            println!("sending wake message");
-            client
-                .read_write_multiple_registers(0x9c4, 20, 0xa8c, &WAKE[..])
-                .and_then(move |res| {
-                    println!("memory value is: {:?}", res);
-                    Ok(())
-                })
-                .then(|res| {
-                    Ok(match res {
-                        Ok(_) => future::Loop::Break(client),
-                        Err(err) => {
-                            println!("error: {:?}", err);
-                            future::Loop::Continue(modbus)
-                        }
-                    })
-                })
-        })
-    })
-    .and_then(move |client| {
-        println!("sending idle");
-        client
-            .read_write_multiple_registers(0x9c4, 20, 0xa8c, &IDLE[..])
-            .and_then(move |res| {
-                println!("memory value is: {:?}", res);
-                Ok(client)
-            })
-    })
-    .and_then(move |client| {
-        println!("sending lead");
-        client
-            .read_write_multiple_registers(0x9c4, 20, 0xa8c, &command[0][..])
-            .and_then(move |res| {
-                println!("memory value is: {:?}", res);
-                Ok((client, res[7]))
-            })
-    })
-    .and_then(move |(client, last_height)| {
-        future::loop_fn(
-            (client, last_height, 0),
-            move |(client, last_height, since_change)| {
-                tokio_timer::sleep(Duration::from_millis(500))
-                    .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))
-                    .and_then(move |_| {
-                        println!("sending command");
-                        client
-                            .read_write_multiple_registers(0x9c4, 20, 0xa8c, &command[1][..])
-                            .and_then(move |res| {
-                                println!("memory value is: {:?}", res);
-                                if res[7] == last_height {
-                                    if since_change < 1 {
-                                        Ok(future::Loop::Continue((
-                                            client,
-                                            res[7],
-                                            since_change + 1,
-                                        )))
-                                    } else {
-                                        Ok(future::Loop::Break(client))
-                                    }
-                                } else {
-                                    Ok(future::Loop::Continue((client, res[7], 0)))
-                                }
-                            })
-                    })
-            },
-        )
-    })
-    .and_then(move |client| {
-        println!("sending idle");
-        client
-            .read_write_multiple_registers(0x9c4, 20, 0xa8c, &IDLE[..])
-            .and_then(move |res| {
-                println!("memory value is: {:?}", res);
-                Ok(client)
-            })
-    });
+    let port = TransferPort::new(TimeoutPort::new(SerialStream::open(&settings)?, Duration::from_millis(500)));
+    let mut client = rtu::connect_slave(port.take(), server_addr).await?;
+    println!("sending wake message");
+    loop {
+        match client.read_write_multiple_registers(0x9c4, 20, 0xa8c, &WAKE[..]).await {
+            Ok(v) => {
+                println!("memory value is: {:?}", v);
+                break;
+            }
+            Err(err) => {
+                println!("error: {:?}", err);
+                client.disconnect().await?;
+                client = rtu::connect_slave(port.take(), server_addr).await?;
+            }
+        }
+    }
+    println!("sending idle");
+    let res = client
+        .read_write_multiple_registers(0x9c4, 20, 0xa8c, &IDLE[..]).await?;
+    println!("memory value is: {:?}", res);
+    println!("sending lead");
+    let res = client
+        .read_write_multiple_registers(0x9c4, 20, 0xa8c, &command[0][..]).await?;
+    println!("memory value is: {:?}", res);
+    let mut last_height = res[7];
+    let mut since_change = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!("sending command");
+        let res = client
+            .read_write_multiple_registers(0x9c4, 20, 0xa8c, &command[1][..]).await?;
+        println!("memory value is: {:?}", res);
+        if res[7] == last_height {
+            if since_change < 1 {
+                since_change += 1;
+            } else {
+                break;
+            }
+        } else {
+            last_height = res[7];
+        }
+    }
+    println!("sending idle");
+    let res = client
+        .read_write_multiple_registers(0x9c4, 20, 0xa8c, &IDLE[..]).await?;
+    println!("memory value is: {:?}", res);
 
-    core.run(task).unwrap();
+    client.disconnect().await?;
+    Ok(())
 }
