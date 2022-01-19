@@ -1,13 +1,16 @@
+use pin_project::pin_project;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration};
-use pin_project::pin_project;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 
 /// A wrapper around an AsyncRead+AsyncWrite to add read timeouts.
+///
+/// This is a workaround for a problem with tokio-serial, which, at least on Windows, ignores any
+/// configured read timeouts.
 #[pin_project]
 pub struct TimeoutPort<T> {
     #[pin]

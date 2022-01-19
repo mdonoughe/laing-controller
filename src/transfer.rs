@@ -1,7 +1,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Waker, Poll, Context};
+use std::task::{Context, Poll, Waker};
 
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -15,7 +15,16 @@ struct TransferPortState<T> {
     tx_task: Option<Waker>,
 }
 
-/// A wrapper around an AsyncRead+AsyncWrite that allows it to be reclaimed.
+/// A wrapper type that allows ownership of an async read+write object to be forcibly transferred.
+///
+/// This is a workaround for problems with tokio-modbus and tokio-serial. If a read timeout occurs,
+/// tokio-modbus does not recover, so we need to reset. However, disconnecting and dropping the
+/// modbus `Context` object does not close the serial port handle, so trying to open the serial port
+/// again for the new context will fail.
+///
+/// When `take` is called, a `TransferPortHandle` implementing `AsyncRead` and `AsyncWrite` is
+/// returned. Calling `take` again will invalidate the old handle, causing all its pending futures
+/// to immediately fail, before returning a new handle.
 pub struct TransferPort<T> {
     state: Arc<Mutex<Pin<Box<TransferPortState<T>>>>>,
 }
@@ -121,11 +130,14 @@ impl<T: AsyncWrite> AsyncWrite for TransferPortHandle<T> {
             Poll::Pending => {
                 *state.tx_task = Some(cx.waker().clone());
                 Poll::Pending
-            },
+            }
         }
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), io::Error>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
         let mut state = self.get_state()?;
         let state = state.as_mut().project();
         match state.inner.poll_flush(cx) {
@@ -136,11 +148,14 @@ impl<T: AsyncWrite> AsyncWrite for TransferPortHandle<T> {
             Poll::Pending => {
                 *state.tx_task = Some(cx.waker().clone());
                 Poll::Pending
-            },
+            }
         }
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), io::Error>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
         let mut state = self.get_state()?;
         let state = state.as_mut().project();
         match state.inner.poll_shutdown(cx) {
@@ -151,12 +166,12 @@ impl<T: AsyncWrite> AsyncWrite for TransferPortHandle<T> {
             Poll::Pending => {
                 *state.tx_task = Some(cx.waker().clone());
                 Poll::Pending
-            },
+            }
         }
     }
 }
 
-impl <T> std::fmt::Debug for TransferPortHandle<T> {
+impl<T> std::fmt::Debug for TransferPortHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransferPortHandle").finish()
     }

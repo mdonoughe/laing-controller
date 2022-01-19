@@ -1,0 +1,32 @@
+id: my-desk
+# This display name will appear in Home Assistant.
+name: My Desk
+# The serial port the controller is attached to.
+serial_port: COM4
+# Optional.
+# prefix: desk
+# hass_prefix: homeassistant
+
+# Connectivity will be published to <prefix>/<id>/connected ON/OFF
+# Height (in inches) will be published to <prefix>/<id>/height
+# Commands will be subscribed from <prefix>/<id>/command
+
+# The commands are:
+# - 1: Go to memory preset 1
+# - 2: Go to memory preset 2
+# - 3: Go to memory preset 3
+# - 4: Go to memory preset 4
+# - REFRESH: Ask the controller for its height (useful if the desk was moved using the buttons)
+
+# If hass_prefix is not "", configuration will be published according to the Home
+# Assistant MQTT discovery spec: https://www.home-assistant.io/docs/mqtt/discovery/
+
+# MQTT connection details:
+mqtt:
+  host: example.com
+  # Optional.
+  # transport: Tls # Alternatively Tcp.
+  # port: 8883 # Default is 1883 when transport is Tcp.
+  # credentials: # Defaults to no authentication.
+  #   username: your-user
+  #   password: secret password
