@@ -4,7 +4,23 @@
 
 laing-controller is a service that connects to a Laing Innotech desk motor controller using modbus over RS485. This is PC software intended to be run from a computer attached to the desk. You'll need hardware for this.
 
-TODO: document how to wire an FTDI USB-RS485 with RJ-25 connectors.
+## Hardware
+
+Follow these instructions at your own risk. Check with a multimeter that the voltages make sense before connecting your expensive desk to your expensive computer. Take extra care to ensure that unexpected movement of the desk will not hit you or anything else when wiring this up.
+
+I recommend getting RJ25 (AKA 6P6C) connectors and a short RJ25 cable, rather than cutting and splicing cable the controller came with. To begin with, connect the pins straight through. It may be possible to do this by buying a barrel connector, but I did it using some cheap breakout boards I got on Amazon.
+
+You will also need a way for your computer to speak RS485. I use an FTDI USB-RS485.
+
+RJ25 is similar to the RJ11 typically used for old phones, but all six conductors are present. The controller only uses four pins, similar to RJ14, but the pins used are 1 2 3 6, not 2 3 4 5 as used for phones.
+
+Do not just buy a USB RJ45 RS485 adapter and assume the wiring is correct. There does not seem to be a standard way to wire these connectors. While writing this documentation, I found only incompatible wiring diagrams.
+
+Pins 1 and 6 are power and ground. Connect the ground wire from your computer to the ground wire of the controller. You can leave the power wire from your computer disconnected because the controller is already providing power.
+
+Pins 2 and 3 are the differential data pair plus and minus wires.
+
+If you get an adapter which has a terminator pair, you can leave that not connected because you're tapping into a connection that is already terminated.
 
 ## Warning
 
@@ -73,3 +89,11 @@ entities:
 
 [Home Assistant]: https://www.home-assistant.io/
 [MQTT discovery]: https://www.home-assistant.io/docs/mqtt/discovery/
+
+## Known issues
+
+laing-controller does not snoop the modbus connection, so when you adjust the hight of the desk using the controls that the desk came with, laing-controller does not notice and does not report the new height over MQTT. You can request a refresh to fix this.
+
+Due to problems with tokio-modbus and tokio-serial, laing-controller stays connected to the serial port, despite not snooping the connection. As a consequence, when the desk height is changed using the controls that the desk came with, the chatter between the controller and its button panel accumulates in laing-controller's read buffer, so when it tries to communicate to the controller it reads garbage data. tokio-modbus skips over some of this, but generally the first few transactions will fail. You can avoid this by requesting a few refreshes before trying to move the desk.
+
+I'm not sure if these problems are worth the effort of implementing snooping.
