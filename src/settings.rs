@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tokio::{fs::File, io::AsyncReadExt};
+use std::fs::File;
 
 #[derive(Deserialize)]
 pub struct Settings {
@@ -51,14 +51,10 @@ pub struct MqttCredential {
     pub password: String,
 }
 
-pub async fn load_settings() -> Result<Settings> {
+pub fn load_settings() -> Result<Settings> {
     let mut path = ::std::env::current_exe().context("Could not find installation directory")?;
     path.pop();
     path.push("laing-controller.yaml");
-    let mut file = File::open(path).await.context("Failed to open settings")?;
-    let mut settings = String::new();
-    file.read_to_string(&mut settings)
-        .await
-        .context("Failed to read settings")?;
-    serde_yaml::from_str(&settings).context("Failed to parse settings")
+    let file = File::open(path).context("Failed to open settings")?;
+    serde_yaml::from_reader(file).context("Failed to load settings")
 }

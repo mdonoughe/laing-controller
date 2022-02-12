@@ -3,12 +3,16 @@ mod settings;
 mod timeout;
 mod transfer;
 
+use anyhow::anyhow;
 use log::{debug, error, info};
 use mqtt::{MqttHandle, State};
-use settings::load_settings;
+use settings::{load_settings, Settings};
 use std::time::Duration;
 use timeout::TimeoutPort;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::oneshot,
+};
 use tokio_modbus::{client::Context, prelude::*};
 use tokio_serial::SerialStream;
 use transfer::TransferPort;
@@ -163,49 +167,258 @@ async fn operate<T: AsyncRead + AsyncWrite + Send + 'static>(
     Ok(last_height)
 }
 
-#[tokio::main(flavor = "current_thread")]
-pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let settings = load_settings().await?;
+#[cfg(windows)]
+windows_service::define_windows_service!(ffi_service_main, service_main);
 
-    let (height_send, height_receive) = tokio::sync::watch::channel(None);
-    let (command_send, command_receive) = tokio::sync::broadcast::channel(2);
-
-    let mqtt = MqttHandle {
-        height: height_send,
-        command: command_receive,
-    };
-
-    let state = State {
-        height: height_receive,
-        command: command_send,
-    };
-
-    let port = TransferPort::new(TimeoutPort::new(
-        SerialStream::open(
-            &tokio_serial::new(&settings.serial_port, 57600).timeout(Duration::from_millis(250)),
-        )?,
-        Duration::from_millis(500),
-    ));
-
-    tokio::select! {
-        result = main_loop(port, mqtt) => result?,
-        result = mqtt_loop(&settings, state) => result?,
+#[cfg(windows)]
+fn service_main(_arguments: Vec<std::ffi::OsString>) {
+    if let Err(err) = real_service_main() {
+        error!("Service failed: {:?}", err);
+        std::process::exit(1);
     }
+}
+
+#[cfg(windows)]
+fn real_service_main() -> anyhow::Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    use windows_service::{
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStatus, ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
+    };
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let status_handle = Arc::new(Mutex::new(Option::<ServiceStatusHandle>::None));
+
+    let main = {
+        let mut lock = status_handle.lock().unwrap();
+        let status_handle = status_handle.clone();
+        let mut stop_tx = Some(stop_tx);
+        *lock = Some(
+            service_control_handler::register("laing-controller", move |control_event| {
+                match control_event {
+                    ServiceControl::Shutdown | ServiceControl::Stop => {
+                        if let Some(stop_tx) = stop_tx.take() {
+                            match stop_tx.send(()) {
+                                Ok(()) => {
+                                    status_handle
+                                        .lock()
+                                        .unwrap()
+                                        .unwrap()
+                                        .set_service_status(ServiceStatus {
+                                            controls_accepted: ServiceControlAccept::empty(),
+                                            current_state:
+                                                windows_service::service::ServiceState::StopPending,
+                                            service_type: ServiceType::OWN_PROCESS,
+                                            exit_code: ServiceExitCode::NO_ERROR,
+                                            checkpoint: 0,
+                                            process_id: Some(std::process::id()),
+                                            // Give us some time to stop in case the desk is in motion.
+                                            wait_hint: Duration::from_secs(10),
+                                        })
+                                        .unwrap();
+                                    ServiceControlHandlerResult::NoError
+                                }
+                                Err(()) => {
+                                    error!("Clean service stop failed");
+                                    ServiceControlHandlerResult::NoError
+                                }
+                            }
+                        } else {
+                            ServiceControlHandlerResult::NoError
+                        }
+                    }
+                    ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                    _ => ServiceControlHandlerResult::NotImplemented,
+                }
+            })
+            .map_err(|e| anyhow!("Failed to register service: {:?}", e))?,
+        );
+
+        let main = Main::init()?;
+
+        lock.unwrap()
+            .set_service_status(ServiceStatus {
+                controls_accepted: ServiceControlAccept::SHUTDOWN | ServiceControlAccept::STOP,
+                current_state: windows_service::service::ServiceState::Running,
+                service_type: ServiceType::OWN_PROCESS,
+                exit_code: ServiceExitCode::NO_ERROR,
+                checkpoint: 0,
+                process_id: Some(std::process::id()),
+                wait_hint: Duration::ZERO,
+            })
+            .map_err(|e| anyhow!("Failed to set service to running: {:?}", e))?;
+        main
+    };
+
+    let result = main.run(stop_rx);
+    let lock = status_handle.lock().unwrap();
+    let code = if let Err(error) = result {
+        error!("Service died: {:?}", error);
+        ServiceExitCode::ServiceSpecific(1)
+    } else {
+        ServiceExitCode::NO_ERROR
+    };
+    lock.unwrap()
+        .set_service_status(ServiceStatus {
+            controls_accepted: ServiceControlAccept::empty(),
+            current_state: windows_service::service::ServiceState::Stopped,
+            service_type: ServiceType::OWN_PROCESS,
+            exit_code: code,
+            checkpoint: 0,
+            process_id: Some(std::process::id()),
+            wait_hint: Duration::ZERO,
+        })
+        .map_err(|e| anyhow!("Failed to set service to stopped: {:?}", e))?;
 
     Ok(())
+}
+
+#[cfg(windows)]
+pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use windows_service::{
+        service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType},
+        service_dispatcher,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    match std::env::args().nth(1).as_deref() {
+        Some("service-register") => {
+            let manager =
+                ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+            manager.create_service(
+                &ServiceInfo {
+                    name: "laing-controller".into(),
+                    display_name: "Laing Controller".into(),
+                    service_type: ServiceType::OWN_PROCESS,
+                    start_type: ServiceStartType::AutoStart,
+                    error_control: ServiceErrorControl::Normal,
+                    executable_path: std::env::current_exe()?,
+                    launch_arguments: vec!["service".into()],
+                    dependencies: vec![],
+                    account_name: None,
+                    account_password: None,
+                },
+                ServiceAccess::QUERY_STATUS,
+            )?;
+            Ok(())
+        }
+        Some("service-deregister") => {
+            let manager =
+                ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+            let service = manager.open_service("laing-controller", ServiceAccess::DELETE)?;
+            service.delete()?;
+            Ok(())
+        }
+        Some("log-register") => {
+            eventlog::register("laing-controller")?;
+            Ok(())
+        }
+        Some("log-deregister") => {
+            eventlog::deregister("laing-controller")?;
+            Ok(())
+        }
+        Some("service") => {
+            let level = match std::env::var("LC_LOG_LEVEL").ok().as_deref() {
+                Some("trace") => log::Level::Trace,
+                Some("debug") => log::Level::Debug,
+                Some("info") => log::Level::Info,
+                Some("warn") => log::Level::Warn,
+                Some("error") => log::Level::Error,
+                _ => log::Level::Info,
+            };
+            eventlog::init("laing-controller", level).unwrap();
+
+            service_dispatcher::start("laing-controller", ffi_service_main)?;
+            Ok(())
+        }
+        Some(other) => return Err(anyhow!("Unexpected parameter: {}", other).into()),
+        _ => {
+            standard_main()?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+    standard_main()?;
+    Ok(())
+}
+
+pub fn standard_main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    Main::init()?.run(stop_rx)?;
+    std::mem::drop(stop_tx);
+    Ok(())
+}
+
+struct Main {
+    settings: Settings,
+    mqtt: MqttHandle,
+    state: State,
+}
+
+impl Main {
+    pub fn init() -> anyhow::Result<Main> {
+        let settings = load_settings()?;
+
+        let (height_send, height_receive) = tokio::sync::watch::channel(None);
+        let (command_send, command_receive) = tokio::sync::broadcast::channel(2);
+
+        let mqtt = MqttHandle {
+            height: height_send,
+            command: command_receive,
+        };
+
+        let state = State {
+            height: height_receive,
+            command: command_send,
+        };
+
+        Ok(Main {
+            settings,
+            mqtt,
+            state,
+        })
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    pub async fn run(self, stop: oneshot::Receiver<()>) -> anyhow::Result<()> {
+        let port = TransferPort::new(TimeoutPort::new(
+            SerialStream::open(
+                &tokio_serial::new(&self.settings.serial_port, 57600)
+                    .timeout(Duration::from_millis(250)),
+            )?,
+            Duration::from_millis(500),
+        ));
+
+        tokio::select! {
+            result = main_loop(port, self.mqtt, stop) => result?,
+            result = mqtt_loop(&self.settings, self.state) => result?,
+        }
+
+        Ok(())
+    }
 }
 
 async fn main_loop<T: AsyncRead + AsyncWrite + Send + 'static>(
     mut port: TransferPort<T>,
     mut mqtt: MqttHandle,
+    mut stop: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let server_addr = Slave(0x01);
     operate(&mut port, server_addr, None, &mut mqtt).await?;
     info!("Controller initialized");
 
     loop {
-        let command = mqtt.command.recv().await?;
+        let command = tokio::select! {
+            command = mqtt.command.recv() => command?,
+            _ = &mut stop => return Ok(()),
+        };
         info!("Got command {:?}", command);
         let command = match command {
             mqtt::Command::Preset1 => Some(&PRESET1),

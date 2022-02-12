@@ -28,11 +28,23 @@ This can be dangerous. Do not put things where they can get in the way of the de
 
 ## Compatible controllers
 
-The only controller confirmed to be compatible is the LTC302-US-00-00-G0.
+The only controller hardware confirmed to be compatible is the LTC302-US-00-00-G0.
 
 ## Configuration and topics
 
 See the file laing-controller.yaml.
+
+## Installation
+
+On Windows, laing-controller has some additional command line parameters:
+- log-register: register the executable with the Windows Event Viewer
+- log-deregister: unregister the executable with the Windows Event Viewer
+- service-register: register the executable as a service (this does not start the service)
+- service-deregister: unregister the executable as a service
+
+By using these commands, you can install laing-controller as a Windows service so it automatically starts and stops with your computer. Log messages will appear in Event Viewer under Windows Logs/Application.
+
+Linux service registration is less complicated and should only require creation of a systemd unit file, without any special service support in laing-controller.
 
 ## Home Assistant
 
